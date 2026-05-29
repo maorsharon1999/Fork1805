@@ -28,6 +28,22 @@ import config as cfg
 
 logger = logging.getLogger("fork_pipeline.report_generator")
 
+
+def _safe_text(text: str) -> str:
+    """Replace characters outside latin-1 range so fpdf helvetica font
+    does not raise FPDFUnicodeEncodingException.
+    Common substitutions: en-dash/em-dash → hyphen, ellipsis → '...'.
+    """
+    return (
+        text
+        .replace("–", "-")   # en-dash
+        .replace("—", "-")   # em-dash
+        .replace("…", "...")  # ellipsis
+        .encode("latin-1", errors="replace")
+        .decode("latin-1")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -399,10 +415,12 @@ def generate_report(
         pdf.set_font("Helvetica", "", 10)
         pdf.multi_cell(
             0, 5.5,
-            "Multi-class LOSO CV classification of ET tremor severity using IMU features. "
-            "Local-score bins: Mild (0–1.5), Moderate (1.5–3.0), Severe (3.0+). "
-            "Global-score bins: Mild (0–8), Moderate (8–20), Severe (20+). "
-            "Only ET patients are included; class_weight='balanced'.",
+            _safe_text(
+                "Multi-class LOSO CV classification of ET tremor severity using IMU features. "
+                "Local-score bins: Mild (0-1.5), Moderate (1.5-3.0), Severe (3.0+). "
+                "Global-score bins: Mild (0-8), Moderate (8-20), Severe (20+). "
+                "Only ET patients are included; class_weight='balanced'."
+            ),
         )
         pdf.ln(4)
 
@@ -420,7 +438,7 @@ def generate_report(
             pdf.ln(1)
 
             counts  = sev_dict.get("class_counts", {})
-            acc_str = _safe_fmt(sev_dict.get("Accuracy")) if "y_true" in sev_dict else "—"
+            acc_str = _safe_fmt(sev_dict.get("Accuracy")) if "y_true" in sev_dict else "N/A"
             rows = []
             for cls_label, cnt in counts.items():
                 rows.append([score_label, cls_label, str(cnt), acc_str])

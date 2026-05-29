@@ -234,15 +234,32 @@ def plot_umap(
     comp = reducer.fit_transform(X_scaled)
 
     label_values = features_df[label_col].values
+
+    # For string/categorical labels encode to integers for scatter coloring,
+    # then annotate the colorbar with the original category names.
+    if label_values.dtype.kind in ("U", "O", "S"):
+        unique_labels = sorted(set(label_values))
+        label_map = {v: i for i, v in enumerate(unique_labels)}
+        color_values = np.array([label_map[v] for v in label_values], dtype=float)
+        cmap = "tab10"
+    else:
+        color_values = label_values.astype(float)
+        unique_labels = None
+        cmap = "coolwarm"
+
     fig, ax = plt.subplots(figsize=(7, 5))
     scatter = ax.scatter(
-        comp[:, 0], comp[:, 1], c=label_values, cmap="coolwarm",
+        comp[:, 0], comp[:, 1], c=color_values, cmap=cmap,
         alpha=0.8, edgecolors="k", linewidths=0.5,
     )
     ax.set_xlabel("UMAP-1")
     ax.set_ylabel("UMAP-2")
     ax.set_title(f"UMAP — colored by {label_col}")
-    fig.colorbar(scatter, ax=ax, label=label_col)
+    cbar = fig.colorbar(scatter, ax=ax, label=label_col)
+    # Replace numeric ticks with original category names for string labels
+    if unique_labels is not None:
+        cbar.set_ticks(list(range(len(unique_labels))))
+        cbar.set_ticklabels(unique_labels)
     _savefig(fig, filename)
 
 

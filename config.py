@@ -92,6 +92,13 @@ PER_SEGMENT = True
 TARGET_SPECIFICITY = 0.80
 
 # ---------------------------------------------------------------------------
+# Checkpointing — resume pipeline after a crash without re-running stages
+# ---------------------------------------------------------------------------
+USE_CHECKPOINTS = True          # save/load stage outputs to disk
+CHECKPOINT_DIR  = os.path.join(SCRIPT_DIR, "output", "checkpoints")
+FORCE_FRESH     = False         # set True (or pass --fresh) to ignore all checkpoints
+
+# ---------------------------------------------------------------------------
 # Stage A: Robust preprocessing
 # ---------------------------------------------------------------------------
 OUTLIER_PERCENTILE_LOW = 0.5

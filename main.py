@@ -24,6 +24,10 @@ from sklearn.feature_selection import RFE
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 
+import pickle
+import hashlib
+import argparse
+
 import config as cfg
 from utils import setup_logging, ensure_output_dirs
 from data_loader import scan_participants, load_imu, load_crf_scores
@@ -61,6 +65,37 @@ logger: logging.Logger
 _IMU_COLS = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def _ckpt_path(name: str) -> str:
+    os.makedirs(cfg.CHECKPOINT_DIR, exist_ok=True)
+    return os.path.join(cfg.CHECKPOINT_DIR, f"{name}.pkl")
+
+
+def _save_ckpt(name: str, data) -> None:
+    if not cfg.USE_CHECKPOINTS:
+        return
+    path = _ckpt_path(name)
+    with open(path, "wb") as fh:
+        pickle.dump(data, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    logger.info("Checkpoint saved → %s", path)
+
+
+def _load_ckpt(name: str):
+    """Return cached data or None if checkpointing is off / file missing / --fresh."""
+    if not cfg.USE_CHECKPOINTS or cfg.FORCE_FRESH:
+        return None
+    path = _ckpt_path(name)
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as fh:
+        data = pickle.load(fh)
+    logger.info("Checkpoint loaded ← %s  (skip recompute)", path)
+    return data
+
+
 def _group_into_tests(
     eating_segs: List, raw_df: pd.DataFrame
 ) -> List[List]:
@@ -90,6 +125,15 @@ def main() -> None:
     logger = setup_logging()
     ensure_output_dirs()
 
+    # Allow --fresh flag to bypass all checkpoints for this run
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--fresh", action="store_true",
+                        help="Ignore all saved checkpoints and recompute every stage.")
+    args, _ = parser.parse_known_args()
+    if args.fresh:
+        cfg.FORCE_FRESH = True
+        logger.info("--fresh flag set: all checkpoints ignored for this run.")
+
     # ── STAGE 1 ───────────────────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info("STAGE 1: Scanning participants…")
@@ -116,241 +160,270 @@ def main() -> None:
         logger.info("Raw Extracted CRF Data:\n" + df_raw_crf.reset_index().to_string())
 
     out_dir_signals = os.path.join(cfg.OUTPUT_DIR, "figures", "patient_signals")
+    handedness_accuracy: Optional[float] = None
     os.makedirs(out_dir_signals, exist_ok=True)
 
-    # ── STAGE 2-4a: Preprocessing + segmentation (data collection pass) ──
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info(
-        "STAGE 2-4a: Robust preprocessing, enhanced segmentation, "
-        "cycle collection…"
-    )
-    logger.info("=" * 60)
+    # ── STAGE 2-5: Preprocessing → feature matrix (checkpoint as a unit) ────
+    # These stages are fast individually but together take ~30-60 s.
+    # Checkpointed as one unit because features_df depends on all prior stages.
+    _ckpt_data = _load_ckpt("features_df")
+    if _ckpt_data is not None:
+        features_df   = _ckpt_data["features_df"]
+        visual_sample = _ckpt_data["visual_sample"]
+        total_segments = _ckpt_data["total_segments"]
+        n_patients     = _ckpt_data["n_patients"]
+        n_et           = _ckpt_data["n_et"]
+        n_ctrl         = _ckpt_data["n_ctrl"]
+        logger.info(
+            "Feature matrix restored: %d rows x %d columns",
+            features_df.shape[0], features_df.shape[1],
+        )
+    else:
+        # ── STAGE 2-4a: Preprocessing + segmentation (data collection pass) ──
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info(
+            "STAGE 2-4a: Robust preprocessing, enhanced segmentation, "
+            "cycle collection…"
+        )
+        logger.info("=" * 60)
 
-    # Each entry: {patient_id, group, filepath, hand_from_file,
-    #              test_key, cycle_df, test_segs, test_df_full, test_df_raw}
-    all_cycle_records: List[Dict] = []
-    # For visualization: store first valid test per patient
-    visual_sample = None
-    file_counts: Dict[str, int] = {}
+        # Each entry: {patient_id, group, filepath, hand_from_file,
+        #              test_key, cycle_df, test_segs, test_df_full, test_df_raw}
+        all_cycle_records: List[Dict] = []
+        # For visualization: store first valid test per patient
+        visual_sample = None
+        file_counts: Dict[str, int] = {}
 
-    for rec in records:
-        patient_id = rec["patient_id"]
-        group = rec["group"]
-        filepath = rec["filepath"]
+        for rec in records:
+            patient_id = rec["patient_id"]
+            group = rec["group"]
+            filepath = rec["filepath"]
 
-        try:
-            df_raw = load_imu(filepath)
-        except (ValueError, pd.errors.ParserError) as exc:
-            logger.warning(
-                "Patient %s: cannot read %s — %s", patient_id, filepath, exc
-            )
-            continue
+            try:
+                df_raw = load_imu(filepath)
+            except (ValueError, pd.errors.ParserError) as exc:
+                logger.warning(
+                    "Patient %s: cannot read %s — %s", patient_id, filepath, exc
+                )
+                continue
 
-        if len(df_raw) == 0:
-            continue
+            if len(df_raw) == 0:
+                continue
 
-        # Stage A: Robust preprocessing
-        df_clean = reject_outliers(df_raw.copy())
-        df_clean = reject_spikes(df_clean)
-        df_smooth = smooth_signal(df_clean.copy())
+            # Stage A: Robust preprocessing
+            df_clean = reject_outliers(df_raw.copy())
+            df_clean = reject_spikes(df_clean)
+            df_smooth = smooth_signal(df_clean.copy())
 
-        # Smoothed acc magnitude for ||a(t)| - 1g| in Cup criterion
-        acc_smooth_mag = compute_magnitude(df_smooth).values
+            # Smoothed acc magnitude for ||a(t)| - 1g| in Cup criterion
+            acc_smooth_mag = compute_magnitude(df_smooth).values
 
-        # Narrow BPF (2-15 Hz) for segmentation
-        df_narrow = df_clean.copy()
-        for col in _IMU_COLS:
-            df_narrow[col] = bandpass_filter(
-                df_narrow[col].values,
-                low=cfg.NARROW_BPF_LOW,
-                high=cfg.NARROW_BPF_HIGH,
-            )
-
-        # Wide BPF (0.5-20 Hz) for feature extraction
-        df_wide = df_clean.copy()
-        for col in _IMU_COLS:
-            df_wide[col] = bandpass_filter(df_wide[col].values)
-
-        # Stage B: Enhanced segmentation (Cup combined criterion)
-        segments = detect_activity(df_narrow, acc_smooth_mag)
-        if not segments:
-            continue
-
-        quality_labels = classify_cycle_quality(segments, df_raw)
-        eating_segs = [
-            (s, e)
-            for (s, e), lbl in zip(segments, quality_labels)
-            if lbl == "cycle"
-        ]
-        if not eating_segs:
-            continue
-
-        fname = os.path.basename(filepath)
-
-        # Group into behavioural tests
-        tests = _group_into_tests(eating_segs, df_raw)
-
-        for test_idx, test_segs in enumerate(tests):
-            test_key = f"{patient_id}__{fname}__{test_idx}"
-
-            for seg_start, seg_end in test_segs:
-                cycle_df = df_wide.iloc[seg_start : seg_end + 1].reset_index(drop=True)
-                all_cycle_records.append(
-                    {
-                        "patient_id": patient_id,
-                        "group": group,
-                        "filepath": filepath,
-                        "test_key": test_key,
-                        "test_segs": test_segs,
-                        "cycle_df": cycle_df,
-                    }
+            # Narrow BPF (2-15 Hz) for segmentation
+            df_narrow = df_clean.copy()
+            for col in _IMU_COLS:
+                df_narrow[col] = bandpass_filter(
+                    df_narrow[col].values,
+                    low=cfg.NARROW_BPF_LOW,
+                    high=cfg.NARROW_BPF_HIGH,
                 )
 
-            # Visualization for first valid test per patient
-            count = file_counts.get(patient_id, 0) + 1
-            file_counts[patient_id] = count
+            # Wide BPF (0.5-20 Hz) for feature extraction
+            df_wide = df_clean.copy()
+            for col in _IMU_COLS:
+                df_wide[col] = bandpass_filter(df_wide[col].values)
 
-            start_pad = max(0, test_segs[0][0] - int(cfg.FS * 2))
-            end_pad = min(len(df_raw) - 1, test_segs[-1][1] + int(cfg.FS * 2))
-            df_test_raw = df_raw.iloc[start_pad : end_pad + 1].copy().reset_index(drop=True)
+            # Stage B: Enhanced segmentation (Cup combined criterion)
+            segments = detect_activity(df_narrow, acc_smooth_mag)
+            if not segments:
+                continue
 
-            if visual_sample is None:
-                mag_full = compute_magnitude(df_raw)
-                shifted_segs = [(s - start_pad, e - start_pad) for s, e in test_segs]
-                visual_sample = {
-                    "magnitude": mag_full[start_pad : end_pad + 1].values,
-                    "activity_segments": shifted_segs,
-                    "patient_id": patient_id,
-                }
+            quality_labels = classify_cycle_quality(segments, df_raw)
+            eating_segs = [
+                (s, e)
+                for (s, e), lbl in zip(segments, quality_labels)
+                if lbl == "cycle"
+            ]
+            if not eating_segs:
+                continue
 
-            viz.plot_and_save_patient_signal(
-                df=df_test_raw,
-                patient_run_id=f"{patient_id}_test{count}",
-                group=group,
-                local_score=0.0,  # placeholder; CRF loaded in pass 2
-                out_dir=out_dir_signals,
-            )
+            fname = os.path.basename(filepath)
 
-    logger.info(
-        "Data collection complete: %d cycle records from %d patients",
-        len(all_cycle_records),
-        len({r["patient_id"] for r in all_cycle_records}),
-    )
+            # Group into behavioural tests
+            tests = _group_into_tests(eating_segs, df_raw)
 
-    if not all_cycle_records:
-        logger.error("No valid cycles found — aborting.")
-        sys.exit(1)
+            for test_idx, test_segs in enumerate(tests):
+                test_key = f"{patient_id}__{fname}__{test_idx}"
 
-    # ── STAGE 4b: Train handedness classifier ────────────────────────────
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("STAGE 4b: Training handedness classifier…")
-    logger.info("=" * 60)
+                for seg_start, seg_end in test_segs:
+                    cycle_df = df_wide.iloc[seg_start : seg_end + 1].reset_index(drop=True)
+                    all_cycle_records.append(
+                        {
+                            "patient_id": patient_id,
+                            "group": group,
+                            "filepath": filepath,
+                            "test_key": test_key,
+                            "test_segs": test_segs,
+                            "cycle_df": cycle_df,
+                        }
+                    )
 
-    hand_clf = HandednessClassifier()
-    handedness_accuracy: Optional[float] = None
+                # Visualization for first valid test per patient
+                count = file_counts.get(patient_id, 0) + 1
+                file_counts[patient_id] = count
 
-    all_cycle_dfs_for_hand = [r["cycle_df"] for r in all_cycle_records]
-    hand_clf.fit(all_cycle_dfs_for_hand, [])
+                start_pad = max(0, test_segs[0][0] - int(cfg.FS * 2))
+                end_pad = min(len(df_raw) - 1, test_segs[-1][1] + int(cfg.FS * 2))
+                df_test_raw = df_raw.iloc[start_pad : end_pad + 1].copy().reset_index(drop=True)
 
-    # ── STAGE 4c: Movement-type clustering (GMM k=4) ─────────────────────
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("STAGE 4c: Movement-type classification (rule-based)…")
-    logger.info("=" * 60)
+                if visual_sample is None:
+                    mag_full = compute_magnitude(df_raw)
+                    shifted_segs = [(s - start_pad, e - start_pad) for s, e in test_segs]
+                    visual_sample = {
+                        "magnitude": mag_full[start_pad : end_pad + 1].values,
+                        "activity_segments": shifted_segs,
+                        "patient_id": patient_id,
+                    }
 
-    move_clf = MovementClassifier()
-    all_cycle_dfs = [r["cycle_df"] for r in all_cycle_records]
-    movement_types: List[str] = ["unknown"] * len(all_cycle_records)
+                viz.plot_and_save_patient_signal(
+                    df=df_test_raw,
+                    patient_run_id=f"{patient_id}_test{count}",
+                    group=group,
+                    local_score=0.0,  # placeholder; CRF loaded in pass 2
+                    out_dir=out_dir_signals,
+                )
 
-    move_clf.fit(all_cycle_dfs)
-    movement_types = move_clf.predict_all_labels(all_cycle_dfs)
-
-    inspection_pdf = os.path.join(cfg.OUTPUT_DIR, "cluster_inspection.pdf")
-    move_clf.generate_inspection_pdf(all_cycle_dfs, output_path=inspection_pdf)
-    logger.info("Movement type inspection PDF saved to %s", inspection_pdf)
-
-    # ── STAGE 5: Feature extraction (second pass) ────────────────────────
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info(
-        "STAGE 5: Feature extraction (PER_SEGMENT=%s)…", cfg.PER_SEGMENT
-    )
-    logger.info("=" * 60)
-
-    # Group cycle records by test_key (preserves test structure)
-    records_by_test: Dict[str, List] = defaultdict(list)
-    for i, r in enumerate(all_cycle_records):
-        records_by_test[r["test_key"]].append((i, r))
-
-    feature_rows: List[pd.DataFrame] = []
-    skipped_patients: set = set()
-    total_segments = 0
-
-    for test_key, idx_rec_pairs in records_by_test.items():
-        first_rec = idx_rec_pairs[0][1]
-        patient_id = first_rec["patient_id"]
-        group = first_rec["group"]
-
-        # Majority-vote hand for this test (signal-based heuristic)
-        hands = [hand_clf.predict(crec["cycle_df"]) for _, crec in idx_rec_pairs]
-        hand = Counter(hands).most_common(1)[0][0]
-
-        scores = load_crf_scores(patient_id, hand, group)
-        if not scores:
-            skipped_patients.add(patient_id)
-            continue
-
-        cycle_dfs = [r["cycle_df"] for _, r in idx_rec_pairs]
-        test_mtypes = [movement_types[cidx] for cidx, _ in idx_rec_pairs]
-
-        row_df = extract_all_features(
-            segments=cycle_dfs,
-            patient_id=patient_id,
-            hand=hand,
-            group=group,
-            local_score=scores["local_score"],
-            global_score=scores["global_score"],
-            age=scores.get("age", 65.0),
-            gender=scores.get("gender", 0.0),
+        logger.info(
+            "Data collection complete: %d cycle records from %d patients",
+            len(all_cycle_records),
+            len({r["patient_id"] for r in all_cycle_records}),
         )
 
-        if row_df is not None:
-            row_df = row_df.copy()
-            n_rows = len(row_df)
+        if not all_cycle_records:
+            logger.error("No valid cycles found — aborting.")
+            sys.exit(1)
 
-            # Assign movement_type per row (one per cycle when PER_SEGMENT=True)
-            if cfg.PER_SEGMENT:
-                mt_padded = (test_mtypes + ["unknown"] * n_rows)[:n_rows]
-                row_df["movement_type"] = mt_padded
-            else:
-                row_df["movement_type"] = Counter(test_mtypes).most_common(1)[0][0]
+        # ── STAGE 4b: Train handedness classifier ────────────────────────────
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("STAGE 4b: Training handedness classifier…")
+        logger.info("=" * 60)
 
-            # 4-cell CRF scores for bucketed regression
-            for k in ["rt_scoop", "lf_scoop", "rt_stab", "lf_stab"]:
-                row_df[k] = scores.get(k, 0.0)
+        hand_clf = HandednessClassifier()
 
-            feature_rows.append(row_df)
-            total_segments += n_rows
+        all_cycle_dfs_for_hand = [r["cycle_df"] for r in all_cycle_records]
+        hand_clf.fit(all_cycle_dfs_for_hand, [])
 
-    logger.info(
-        "Feature extraction: %d valid tests → %d segments "
-        "(%d patients skipped due to missing CRF)",
-        len(feature_rows), total_segments, len(skipped_patients),
-    )
+        # ── STAGE 4c: Movement-type clustering (GMM k=4) ─────────────────────
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("STAGE 4c: Movement-type classification (rule-based)…")
+        logger.info("=" * 60)
 
-    if not feature_rows:
-        logger.error("Feature extraction produced no rows — aborting.")
-        sys.exit(1)
+        move_clf = MovementClassifier()
+        all_cycle_dfs = [r["cycle_df"] for r in all_cycle_records]
+        movement_types: List[str] = ["unknown"] * len(all_cycle_records)
 
-    features_df = pd.concat(feature_rows, ignore_index=True)
-    logger.info(
-        "Feature matrix: %d rows × %d columns",
-        features_df.shape[0], features_df.shape[1],
-    )
+        move_clf.fit(all_cycle_dfs)
+        movement_types = move_clf.predict_all_labels(all_cycle_dfs)
 
-    # ── STAGE 6: Regression (existing, unchanged) ─────────────────────────
+        inspection_pdf = os.path.join(cfg.OUTPUT_DIR, "cluster_inspection.pdf")
+        move_clf.generate_inspection_pdf(all_cycle_dfs, output_path=inspection_pdf)
+        logger.info("Movement type inspection PDF saved to %s", inspection_pdf)
+
+        # ── STAGE 5: Feature extraction (second pass) ────────────────────────
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info(
+            "STAGE 5: Feature extraction (PER_SEGMENT=%s)…", cfg.PER_SEGMENT
+        )
+        logger.info("=" * 60)
+
+        # Group cycle records by test_key (preserves test structure)
+        records_by_test: Dict[str, List] = defaultdict(list)
+        for i, r in enumerate(all_cycle_records):
+            records_by_test[r["test_key"]].append((i, r))
+
+        feature_rows: List[pd.DataFrame] = []
+        skipped_patients: set = set()
+        total_segments = 0
+
+        for test_key, idx_rec_pairs in records_by_test.items():
+            first_rec = idx_rec_pairs[0][1]
+            patient_id = first_rec["patient_id"]
+            group = first_rec["group"]
+
+            # Majority-vote hand for this test (signal-based heuristic)
+            hands = [hand_clf.predict(crec["cycle_df"]) for _, crec in idx_rec_pairs]
+            hand = Counter(hands).most_common(1)[0][0]
+
+            scores = load_crf_scores(patient_id, hand, group)
+            if not scores:
+                skipped_patients.add(patient_id)
+                continue
+
+            cycle_dfs = [r["cycle_df"] for _, r in idx_rec_pairs]
+            test_mtypes = [movement_types[cidx] for cidx, _ in idx_rec_pairs]
+
+            row_df = extract_all_features(
+                segments=cycle_dfs,
+                patient_id=patient_id,
+                hand=hand,
+                group=group,
+                local_score=scores["local_score"],
+                global_score=scores["global_score"],
+                age=scores.get("age", 65.0),
+                gender=scores.get("gender", 0.0),
+            )
+
+            if row_df is not None:
+                row_df = row_df.copy()
+                n_rows = len(row_df)
+
+                # Assign movement_type per row (one per cycle when PER_SEGMENT=True)
+                if cfg.PER_SEGMENT:
+                    mt_padded = (test_mtypes + ["unknown"] * n_rows)[:n_rows]
+                    row_df["movement_type"] = mt_padded
+                else:
+                    row_df["movement_type"] = Counter(test_mtypes).most_common(1)[0][0]
+
+                # 4-cell CRF scores for bucketed regression
+                for k in ["rt_scoop", "lf_scoop", "rt_stab", "lf_stab"]:
+                    row_df[k] = scores.get(k, 0.0)
+
+                feature_rows.append(row_df)
+                total_segments += n_rows
+
+        logger.info(
+            "Feature extraction: %d valid tests → %d segments "
+            "(%d patients skipped due to missing CRF)",
+            len(feature_rows), total_segments, len(skipped_patients),
+        )
+
+        if not feature_rows:
+            logger.error("Feature extraction produced no rows — aborting.")
+            sys.exit(1)
+
+        features_df = pd.concat(feature_rows, ignore_index=True)
+        logger.info(
+            "Feature matrix: %d rows x %d columns",
+            features_df.shape[0], features_df.shape[1],
+        )
+        # Recalculate patient counts from assembled features_df
+        n_patients = features_df["patient_id"].nunique()
+        n_et       = features_df[features_df["group"] == "ET"]["patient_id"].nunique()
+        n_ctrl     = features_df[features_df["group"] == "Control"]["patient_id"].nunique()
+        _save_ckpt("features_df", {
+            "features_df":   features_df,
+            "visual_sample": visual_sample,
+            "total_segments": total_segments,
+            "n_patients": n_patients,
+            "n_et":       n_et,
+            "n_ctrl":     n_ctrl,
+        })
+    # end else (checkpoint miss for features_df)
+
+    # ── STAGE 6: Regression ───────────────────────────────────────────────
     logger.info("")
     logger.info("=" * 60)
     logger.info(
@@ -359,24 +432,33 @@ def main() -> None:
     )
     logger.info("=" * 60)
 
-    et_df = features_df[features_df["group"] == "ET"].copy()
-    if len(et_df) >= 5:
-        logger.info("── Local score regression (fork feeding) ──")
-        reg_local = run_regression(et_df, target_col="local_score")
-        logger.info("")
-        logger.info("── Global score regression (Subtotal B Ext) ──")
-        reg_global = run_regression(et_df, target_col="global_score")
+    _reg = _load_ckpt("regression")
+    if _reg is not None:
+        reg_local, reg_global = _reg["reg_local"], _reg["reg_global"]
     else:
-        logger.warning("Only %d ET samples — skipping regression", len(et_df))
-        reg_local = {}
-        reg_global = {}
+        et_df = features_df[features_df["group"] == "ET"].copy()
+        if len(et_df) >= 5:
+            logger.info("── Local score regression (fork feeding) ──")
+            reg_local = run_regression(et_df, target_col="local_score")
+            logger.info("")
+            logger.info("── Global score regression (Subtotal B Ext) ──")
+            reg_global = run_regression(et_df, target_col="global_score")
+        else:
+            logger.warning("Only %d ET samples — skipping regression", len(et_df))
+            reg_local = {}
+            reg_global = {}
+        _save_ckpt("regression", {"reg_local": reg_local, "reg_global": reg_global})
 
     # ── STAGE 6b: Bucketed regression ─────────────────────────────────────
     logger.info("")
     logger.info("=" * 60)
-    logger.info("STAGE 6b: Bucketed regression (Hand × Movement Type)…")
+    logger.info("STAGE 6b: Bucketed regression (Hand x Movement Type)…")
     logger.info("=" * 60)
-    bucketed_results = run_bucketed_regression(features_df)
+
+    bucketed_results = _load_ckpt("bucketed_regression")
+    if bucketed_results is None:
+        bucketed_results = run_bucketed_regression(features_df)
+        _save_ckpt("bucketed_regression", bucketed_results)
 
     # Log bucket-level cycle counts for sparsity audit
     if "movement_type" in features_df.columns and "hand" in features_df.columns:
@@ -393,49 +475,75 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("STAGE 7: Classification (ET vs Control)…")
     logger.info("=" * 60)
-    cls_results = run_classification(features_df)
 
+    cls_results = _load_ckpt("classification")
+    if cls_results is None:
+        cls_results = run_classification(features_df)
+        _save_ckpt("classification", cls_results)
+
+    # ── STAGE 7b: Regress-then-classify ──────────────────────────────────
     logger.info("")
     logger.info("=" * 60)
     logger.info("STAGE 7b: Regress-then-classify…")
     logger.info("=" * 60)
-    rtc_results = run_regress_then_classify(features_df, score_col="global_score")
 
+    rtc_results = _load_ckpt("rtc")
+    if rtc_results is None:
+        rtc_results = run_regress_then_classify(features_df, score_col="global_score")
+        _save_ckpt("rtc", rtc_results)
+
+    # ── STAGE 7c: Calibrated classifiers ─────────────────────────────────
     logger.info("")
     logger.info("=" * 60)
     logger.info("STAGE 7c: Calibrated classifiers…")
     logger.info("=" * 60)
-    cal_results = run_calibrated_classification(features_df)
 
+    cal_results = _load_ckpt("calibrated")
+    if cal_results is None:
+        cal_results = run_calibrated_classification(features_df)
+        _save_ckpt("calibrated", cal_results)
+
+    # ── STAGE 7d: SHAP analysis ───────────────────────────────────────────
     logger.info("")
     logger.info("=" * 60)
     logger.info("STAGE 7d: SHAP analysis…")
     logger.info("=" * 60)
-    et_df = features_df[features_df["group"] == "ET"].copy()
-    shap_reg = run_shap_analysis(et_df, target="local_score", task="regression")
-    shap_cls = run_shap_analysis(features_df, task="classification")
+
+    _shap = _load_ckpt("shap")
+    if _shap is not None:
+        shap_reg, shap_cls = _shap["shap_reg"], _shap["shap_cls"]
+    else:
+        et_df = features_df[features_df["group"] == "ET"].copy()
+        shap_reg = run_shap_analysis(et_df, target="local_score", task="regression")
+        shap_cls = run_shap_analysis(features_df, task="classification")
+        _save_ckpt("shap", {"shap_reg": shap_reg, "shap_cls": shap_cls})
 
     # ── STAGE 7e: Severity classification ────────────────────────────────
     logger.info("")
     logger.info("=" * 60)
     logger.info("STAGE 7e: ET severity classification (Mild/Moderate/Severe)…")
     logger.info("=" * 60)
-    try:
-        sev_local = run_severity_classification(features_df, score_col="local_score")
-    except Exception as _exc:
-        logger.warning("Severity classification (local_score) crashed: %s", _exc, exc_info=True)
-        sev_local = {}
-    try:
-        sev_global = run_severity_classification(features_df, score_col="global_score")
-    except Exception as _exc:
-        logger.warning("Severity classification (global_score) crashed: %s", _exc, exc_info=True)
-        sev_global = {}
-    # Binary severity: {0,1} vs {2,3,4} on raw per-item TETRAS cells (advisor item 3a)
-    try:
-        sev_binary = run_binary_severity_classification(features_df)
-    except Exception as _exc:
-        logger.warning("Binary severity classification crashed: %s", _exc, exc_info=True)
-        sev_binary = {}
+
+    _sev = _load_ckpt("severity")
+    if _sev is not None:
+        sev_local, sev_global, sev_binary = _sev["sev_local"], _sev["sev_global"], _sev["sev_binary"]
+    else:
+        try:
+            sev_local = run_severity_classification(features_df, score_col="local_score")
+        except Exception as _exc:
+            logger.warning("Severity classification (local_score) crashed: %s", _exc, exc_info=True)
+            sev_local = {}
+        try:
+            sev_global = run_severity_classification(features_df, score_col="global_score")
+        except Exception as _exc:
+            logger.warning("Severity classification (global_score) crashed: %s", _exc, exc_info=True)
+            sev_global = {}
+        try:
+            sev_binary = run_binary_severity_classification(features_df)
+        except Exception as _exc:
+            logger.warning("Binary severity classification crashed: %s", _exc, exc_info=True)
+            sev_binary = {}
+        _save_ckpt("severity", {"sev_local": sev_local, "sev_global": sev_global, "sev_binary": sev_binary})
 
     # ── STAGE 8: Visualisations ───────────────────────────────────────────
     logger.info("")

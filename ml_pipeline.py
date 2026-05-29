@@ -1291,7 +1291,6 @@ def run_binary_severity_classification(
     or an empty dict if classification is not feasible.
     """
     from sklearn.pipeline import Pipeline
-    from sklearn.base import clone
 
     et_df = features_df[features_df["group"] == "ET"].copy()
 
@@ -1318,6 +1317,10 @@ def run_binary_severity_classification(
         elif mt == "stab":
             return float(row["rt_stab"] if hand == "Right" else row["lf_stab"])
         return float("nan")
+
+    # Capture feature columns BEFORE adding the target-derived cell column
+    # to avoid it leaking into X as a feature.
+    feat_cols = _feature_cols(et_df)
 
     et_df["_raw_tetras_cell"] = et_df.apply(_matched_cell, axis=1)
 
@@ -1354,7 +1357,7 @@ def run_binary_severity_classification(
         return {"class_counts": class_counts}
 
     X = (
-        et_df[_feature_cols(et_df)]
+        et_df[feat_cols]
         .select_dtypes(include=[np.number])
         .replace([np.inf, -np.inf], np.nan)
         .fillna(0.0)

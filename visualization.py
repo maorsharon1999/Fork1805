@@ -320,7 +320,10 @@ def plot_confusion_matrix(
     if labels is None:
         labels = ["Control", "ET"]
 
-    cm = cm_func(y_true, y_pred, labels=list(range(len(labels))))
+    # Use the actual unique values present in y_true/y_pred for CM ordering,
+    # then map display_labels by position so Control→row0, ET→row1.
+    unique_vals = sorted(np.unique(np.concatenate([y_true, y_pred])))
+    cm = cm_func(y_true, y_pred, labels=unique_vals)
     row_sums = cm.sum(axis=1, keepdims=True)
     # Row-normalised: each row sums to 1 (per-class recall / sensitivity)
     cm_norm = np.divide(cm.astype(float), row_sums, where=row_sums > 0)

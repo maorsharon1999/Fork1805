@@ -285,31 +285,140 @@ All parameters in `config.py`:
 
 ---
 
-## Current Results (Stage 23, LOSO CV, 381 segments, 24 patients)
+## Current Results (LOSO CV, 381 segments, 24 patients — run 2026-05-29)
 
-### Regression — Local Score (ET only)
+> Train R² vs CV R² gap is shown for every model to expose overfitting (advisor requirement).
+> XGBoost Train R²=1.000 vs CV R²=0.57 is a clear overfitting signal at this dataset size.
 
-| Model | MAE | R² | Pearson r |
-|-------|-----|-----|----------|
-| LinearRegression | 0.538 | 0.618 | 0.819 |
-| **Ridge** | **0.536** | **0.628** | **0.828** |
-| Lasso | 0.566 | 0.611 | 0.844 |
-| RandomForest | 0.566 | 0.594 | 0.796 |
+### Regression — Local Score (ET only, LOSO CV)
+
+| Model | Train R² | CV R² | CV MAE | Pearson r |
+|-------|----------|-------|--------|-----------|
+| LinearRegression | 0.840 | 0.596 | 0.543 | — |
+| **Ridge** | 0.837 | **0.607** | **0.538** | — |
+| Lasso | 0.767 | 0.591 | 0.570 | — |
+| RandomForest | 0.984 | 0.570 | 0.576 | — |
+| **GradientBoosting** | 0.996 | **0.630** | **0.528** | — |
+| XGBoost | **1.000** | 0.571 | 0.535 | — |
+
+### Regression — Global Score / Subtotal-B Extended (ET only, LOSO CV)
+
+| Model | Train R² | CV R² | CV MAE |
+|-------|----------|-------|--------|
+| LinearRegression | 0.924 | 0.653 | 4.714 |
+| Ridge | 0.915 | 0.674 | 4.570 |
+| **Lasso** | 0.897 | **0.715** ✓ | **4.281** |
+| RandomForest | 0.987 | 0.621 | 4.861 |
+| GradientBoosting | 0.995 | 0.611 | 4.932 |
+| XGBoost | 1.000 | 0.543 | 5.253 |
+
+> Lasso global-score CV R²=0.715 meets the advisor's 0.70 target.
+
+### Bucketed Regression (raw per-hand TETRAS cell, LOSO CV)
+
+| Bucket | Model | R² | Pearson r | MAE |
+|--------|-------|----|-----------|-----|
+| Scoop | Ridge | 0.513 | 0.722 | 0.601 |
+| Scoop | **GradientBoosting** | **0.554** | **0.749** | 0.627 |
+| Stab | Ridge | 0.383 | 0.644 | 0.615 |
+| Stab | **XGBoost** | **0.420** | **0.656** | **0.581** |
+
+### Classification — ET vs Control (segment-level, LOSO CV)
+
+| Model | Accuracy | AUC | Sensitivity | Specificity |
+|-------|----------|-----|-------------|-------------|
+| LogisticRegression | 0.622 | 0.593 | 0.642 | 0.557 |
+| **SVC** | 0.669 | **0.635** | 0.689 | 0.602 |
+| RandomForest | 0.759 | 0.622 | 0.887 | 0.330 |
+| GradientBoosting | 0.743 | 0.572 | 0.857 | 0.364 |
+| XGBoost | 0.738 | 0.624 | 0.836 | 0.409 |
 
 ### Classification — ET vs Control (patient-level, Specificity ≥ 0.80 target)
 
 | Model | Sensitivity | Specificity | AUC |
 |-------|-------------|-------------|-----|
-| SVC_calibrated_patient | 0.357 | **0.800** | 0.671 |
-| RF_calibrated_patient | 0.357 | **0.800** | 0.564 |
-| LR_Youden | 0.686 | 0.591 | 0.651 |
-| XGBoost_Youden | 0.730 | 0.545 | 0.632 |
+| LogisticRegression (mean) | 0.714 | 0.800 | 0.686 |
+| **XGBoost (median)** | **0.500** | **0.800** | **0.621** |
+| SVC_calibrated (top3mean) | 0.500 | 0.900 | 0.614 |
+| RF_calibrated (mean) | 0.571 | 0.800 | 0.629 |
 
-### SHAP Top Biomarkers (current run)
-- **Regression:** `gyro_y_cwt_energy_ratio` (0.25), `gyro_p2p_mean` (0.17), `gyro_mag_ptp` (0.11)
-- **Classification:** `gyro_wt_mean_freq` (0.81), `gyro_x_spec_rolloff` (0.62), `corr_acc_y_acc_z` (0.57)
+### Regress-then-Classify (Youden optimal threshold)
 
-> Sensitivity at the Specificity=0.80 constraint is limited by the small cohort (24 patients) and the class imbalance in labeled hand data. Regression performance is solid (r=0.83) and is the more reliable signal at this dataset size.
+| Threshold | Accuracy | Sensitivity | Specificity | AUC |
+|-----------|----------|-------------|-------------|-----|
+| Youden J optimal (8.806) | 0.680 | 0.679 | 0.682 | **0.677** |
+
+### Severity Classification (ET only, LOSO CV)
+
+| Task | Classes | Accuracy | AUC |
+|------|---------|----------|-----|
+| 3-class local_score | Mild=127 / Moderate=111 / Severe=55 | 0.614 | — |
+| 3-class global_score | Mild=40 / Moderate=128 / Severe=125 | 0.526 | — |
+| **Binary {0,1} vs {2,3,4}** | Low=79 / High=83 | **0.667** | **0.681** |
+
+> Binary severity (advisor item 3a): Sensitivity=0.639, Specificity=0.696.
+
+### SHAP Top Biomarkers
+
+**Regression (local score):**
+| Rank | Feature | Mean |SHAP| |
+|------|---------|------|
+| 1 | `gyro_y_cwt_energy_ratio` | 0.141 |
+| 2 | `gyro_z_ptp` | 0.095 |
+| 3 | `gyro_wt_mean_freq` | 0.093 |
+| 4 | `gyro_p2p_mean` | 0.089 |
+| 5 | `gyro_x_jerk_max` | 0.070 |
+
+**Classification (ET vs Control):**
+| Rank | Feature | Mean |SHAP| |
+|------|---------|------|
+| 1 | `gyro_wt_mean_freq` | 0.045 |
+| 2 | `gyro_wt_median_freq` | 0.035 |
+| 3 | `gyro_x_spec_rolloff` | 0.026 |
+| 4 | `gyro_x_spec_centroid` | 0.021 |
+| 5 | `gyro_y_spec_centroid` | 0.019 |
+
+> Sensitivity at the Specificity=0.80 constraint is limited by the small cohort (24 patients).
+> Regression is the stronger signal — Lasso global-score CV R²=0.715 meets the advisor target.
+> Key overfitting observation: XGBoost / GradientBoosting show Train R²≈1.0 vs CV R²≈0.57,
+> confirming the advisor's concern. Ridge and Lasso generalise best.
+
+---
+
+## Logs
+
+By default all logs print to the CMD window only. To also save them to a file, run:
+
+```powershell
+python main.py 2>&1 | Tee-Object -FilePath "output\run.log"
+```
+
+The log file is then saved at:
+
+```
+Fork1805/
+└── output/
+    └── run.log
+```
+
+**Checkpoints** (stage-by-stage resume after a crash) are saved here:
+
+```
+Fork1805/
+└── output/
+    └── checkpoints/
+        ├── features_df.pkl        ← Stages 2-5 (preprocessing + features)
+        ├── regression.pkl         ← Stage 6
+        ├── bucketed_regression.pkl
+        ├── classification.pkl     ← Stage 7
+        ├── rtc.pkl
+        ├── calibrated.pkl
+        ├── shap.pkl
+        └── severity.pkl
+```
+
+If the pipeline crashes, just re-run `python main.py` — completed stages load from their `.pkl` in ~1 second.
+To force a full recompute from scratch: `python main.py --fresh`
 
 ---
 

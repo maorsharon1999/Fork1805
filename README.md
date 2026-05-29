@@ -11,7 +11,7 @@ An automated pipeline for detecting and quantifying Essential Tremor (ET) during
 - **13-feature hand classifier** — logistic regression with chirality-sensitive gyro + gravity-projection features
 - **Rule-based movement classifier** — deterministic scoop/stab/fragment/other labels from biomechanical thresholds (no GMM, no retraining)
 - **VarianceThreshold & RFE** — removes constant features and automatically selects optimal 25 features
-- **Class Balancing (SMOTE)** — synthetic oversampling of minority class inside CV loop
+- **Class Balancing** — class_weight / scale_pos_weight on all models (SMOTE removed; see note below)
 - **8 ML models** with Leave-One-Subject-Out (LOSO) cross-validation
 - **Regression** — clinical tremor score prediction (R²=0.63, Pearson r=0.83 Local Score, LOSO)
 - **Classification** — ET vs Control (AUC=0.67, Specificity=0.80 at patient level)
@@ -22,7 +22,11 @@ An automated pipeline for detecting and quantifying Essential Tremor (ET) during
 - **RFE Feature Stability** — tracks which features survive the LOSO cross-validation splits
 - **Automated PDF Report** — clinical report with all metrics, figures, and SHAP/RFE tables
 - **Clinical metrics**: Sensitivity, Specificity, PPV, NPV, Pearson r, Spearman ρ
-- **Clinical visualizations**: Confusion Matrix, Bland-Altman plot, ROC, PCA, SHAP plots
+- **Binary severity classification** — {0,1} vs {2,3,4} on raw per-item TETRAS cells (`run_binary_severity_classification`)
+- **Train vs CV R² reporting** — train-fold and CV R² both annotated on scatter plots to expose overfitting gap
+- **Normalized confusion matrices** — two-panel (raw counts + row-normalised recall) for binary and severity CMs
+- **UMAP visualization** — 2-D EDA scatter colored by label (named features kept as model inputs)
+- **Clinical visualizations**: Confusion Matrix (normalized), Bland-Altman, ROC, PCA, UMAP, SHAP plots
 
 ---
 
@@ -87,11 +91,13 @@ flowchart TD
     H --> I["Stage 7b: Regress-then-Classify"]
     H --> J["Stage 7c: Calibrated Classification"]
     H --> K["Stage 7d: SHAP Interpretability"]
-    F --> L["Stage 8: Visualizations"]
+    E --> N["Stage 7e: Severity Classification\n(3-class + binary {0,1} vs {2,3,4})"]
+    F --> L["Stage 8: Visualizations\n(PCA, UMAP, normalized CMs, R²-annotated scatter)"]
     G --> L
     I --> L
     J --> L
     K --> L
+    N --> L
     L --> M["Stage 9: Clinical PDF Report"]
 ```
 
@@ -228,11 +234,13 @@ Visualizes feature importance using `shap.TreeExplainer`. Generates bar plots an
 |------|------|---------|
 | Patient Signals | `patient_signals/{group}_{id}_run{n}.png` | Acc + Gyro per recording |
 | PCA 2D | `pca_et_vs_control.png` | ET vs Control projection |
+| UMAP 2D | `umap_et_vs_control.png` | EDA scatter (UMAP, colored by is_et) |
 | Boxplot | `boxplot_features.png` | Feature distributions by group |
 | Activity | `activity_XXX.png` | Detected activity segments |
-| Scatter | `scatter_local_score.png` | Predicted vs True scores |
+| Scatter | `scatter_local_score.png` | Predicted vs True scores (train R² + CV R² annotated) |
 | Bland-Altman | `bland_altman_local.png` | Clinical validation standard |
-| Confusion Matrix | `confusion_matrix.png` | TP/FP/FN/TN |
+| Confusion Matrix | `confusion_matrix.png` | 2-panel: raw counts + row-normalised recall |
+| Severity CM | `severity_cm_local.png` / `severity_cm_global.png` | 3-class severity (2-panel) |
 | ROC | `roc_et_vs_control.png` | ROC curve with AUC |
 | SHAP Bar | `shap_bar_*.png` | Top feature global importances |
 | SHAP Beeswarm | `shap_beeswarm_*.png` | Feature impact distributions |
@@ -258,6 +266,8 @@ All parameters in `config.py`:
 | `PER_SEGMENT` | True | Per-segment predictions |
 | `TOP_K_FEATURES` | 25 | Features selected by RFE |
 | `INCLUDE_AMBIGUOUS_FORK` | True | Include Fork_*.csv files |
+| `SEVERITY_BINARY_THRESHOLD` | 2 | Raw TETRAS cell value: < 2 → "Low" {0,1}, ≥ 2 → "High" {2,3,4} |
+| `SEVERITY_BINARY_LABELS` | ["Low","High"] | Labels for binary severity classification |
 
 **Rule-based movement classifier thresholds (`RULE_*`):**
 
@@ -314,7 +324,12 @@ matplotlib>=3.7
 openpyxl>=3.1
 xgboost>=2.0
 shap>=0.42
+imbalanced-learn>=0.11
+fpdf2>=2.7
+umap-learn>=0.5
 ```
+
+> **Note on class balancing:** SMOTE was removed from the classification pipeline. It operated at the segment level and interpolated between samples from different patients, leaking patient identity across LOSO folds and distorting decision boundaries at small N. Class imbalance is handled entirely via `class_weight="balanced"` / `scale_pos_weight` on each model.
 
 ---
 

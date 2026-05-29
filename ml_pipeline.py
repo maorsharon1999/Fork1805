@@ -389,7 +389,10 @@ def run_regression(features_df, target_col="local_score") -> Dict[str, Dict[str,
     _logged_reg_features = False
     for name, estimator in base_models.items():
         pipe = _make_pipeline(estimator)
-        y_pred = np.zeros(len(y))
+        y_pred      = np.zeros(len(y))
+        # Train-fold predictions: collect in-sample preds per fold to measure
+        # train vs CV gap (advisor requirement — strict train/test separation).
+        y_pred_train = np.full(len(y), np.nan)
 
         cv_splitter = cv.split(X, y, groups) if hasattr(cv, "split") else KFold(cfg.CV_FOLDS, shuffle=True, random_state=cfg.RANDOM_STATE).split(X, y)
         for train_idx, test_idx in cv_splitter:
@@ -414,6 +417,8 @@ def run_regression(features_df, target_col="local_score") -> Dict[str, Dict[str,
                 _logged_reg_features = True
 
             y_pred[test_idx] = fold_pipe.predict(X_test_raw)
+            # Capture train-fold predictions (original X_train_raw before augmentation)
+            y_pred_train[train_idx] = fold_pipe.predict(X.iloc[train_idx].copy())
 
         if cfg.PER_SEGMENT and "patient_id" in valid_df.columns:
             # FIXED: PER_SEGMENT агрегация — убрать fallback без агрегации, Only original rows
@@ -422,9 +427,32 @@ def run_regression(features_df, target_col="local_score") -> Dict[str, Dict[str,
             y_true_agg, y_pred_agg = y.values, y_pred
 
         metrics = compute_regression_metrics(y_true_agg, y_pred_agg)
+
+        # Train-fold metrics: use indices covered by at least one fold
+        train_covered = ~np.isnan(y_pred_train)
+        if train_covered.sum() >= 3:
+            if cfg.PER_SEGMENT and "patient_id" in valid_df.columns:
+                y_true_tr, y_pred_tr = _aggregate_segment_predictions(
+                    valid_df[train_covered].reset_index(drop=True),
+                    y_pred_train[train_covered], target_col,
+                )
+            else:
+                y_true_tr, y_pred_tr = y.values[train_covered], y_pred_train[train_covered]
+            train_metrics = compute_regression_metrics(y_true_tr, y_pred_tr)
+            # Store train metrics with "train_" prefix for plotting
+            metrics["train_R2"]  = train_metrics["R2"]
+            metrics["train_MAE"] = train_metrics["MAE"]
+            logger.info(
+                "  %-20s  TRAIN → MAE=%.3f  R²=%.3f  |  CV → MAE=%.3f  R²=%.3f",
+                name,
+                train_metrics["MAE"], train_metrics["R2"],
+                metrics["MAE"],       metrics["R2"],
+            )
+        else:
+            logger.info("  %-20s  MAE=%.3f  R²=%.3f  Pearson_r=%.3f",
+                         name, metrics["MAE"], metrics["R2"], metrics.get("Pearson_r", 0))
+
         results[name] = metrics
-        logger.info("  %-20s  MAE=%.3f  R²=%.3f  Pearson_r=%.3f",
-                     name, metrics["MAE"], metrics["R2"], metrics.get("Pearson_r", 0))
 
     # Stacking — also manual fold for train augmentation
     if cfg.USE_STACKING and len(base_models) >= 2:
@@ -526,7 +554,11 @@ def compute_patient_metrics(
 
 
 def run_classification(features_df) -> Dict[str, Dict[str, float]]:
-    """Run ET vs Control classification with LOSO CV, in-fold VT+RFE+SMOTE.
+    """Run ET vs Control classification with LOSO CV, in-fold VT+RFE.
+
+    Class imbalance is handled via class_weight / scale_pos_weight on each model.
+    SMOTE was removed: at segment level it interpolated across patients, leaking
+    patient identity and undermining LOSO. Class weights are the correct correction.
 
     Runs twice:
       - motion-only (scoop+stab rows, suffix ``_mo``) — primary hypothesis
@@ -534,7 +566,6 @@ def run_classification(features_df) -> Dict[str, Dict[str, float]]:
     """
     from sklearn.pipeline import Pipeline
     from sklearn.feature_selection import RFE
-    from imblearn.over_sampling import SMOTE
     from sklearn.base import clone
 
     all_results: Dict[str, Dict[str, float]] = {}
@@ -563,7 +594,6 @@ def run_classification(features_df) -> Dict[str, Dict[str, float]]:
             continue
 
         cv = _build_cv(groups, task="classification")
-        smote = SMOTE(random_state=cfg.RANDOM_STATE)
 
         n_et = int(sum(y == 1))
         n_ctrl = int(sum(y == 0))
@@ -631,13 +661,10 @@ def run_classification(features_df) -> Dict[str, Dict[str, float]]:
                                 _label, len(sel_cols), sel_cols)
                     _logged_features = True
 
-                try:
-                    X_train_res, y_train_res = smote.fit_resample(X_train_sel, y_train)
-                except ValueError:
-                    X_train_res, y_train_res = X_train_sel, y_train
-
+                # Class imbalance handled by class_weight / scale_pos_weight on the model.
+                # SMOTE removed: segment-level resampling leaks patient identity in LOSO.
                 fold_model = clone(model)
-                fold_model.fit(X_train_res, y_train_res)
+                fold_model.fit(X_train_sel, y_train)
                 y_pred[test_idx] = fold_model.predict(X_test_sel)
                 if has_proba:
                     y_score[test_idx] = fold_model.predict_proba(X_test_sel)[:, 1]
@@ -688,12 +715,10 @@ def run_classification(features_df) -> Dict[str, Dict[str, float]]:
                 rfe_.fit(X_tr_s, y_tr)
                 X_tr_sel = rfe_.transform(X_tr_s)
                 X_te_sel = rfe_.transform(X_te_s)
-                try:
-                    X_tr_res, y_tr_res = smote.fit_resample(X_tr_sel, y_tr)
-                except ValueError:
-                    X_tr_res, y_tr_res = X_tr_sel, y_tr
+                # SMOTE removed: segment-level resampling leaks patient identity in LOSO.
+                # Class weights on constituent models handle imbalance.
                 fs = clone(stack)
-                fs.fit(X_tr_res, y_tr_res)
+                fs.fit(X_tr_sel, y_tr)
                 y_pred_stack[test_idx] = fs.predict(X_te_sel)
                 y_score_stack[test_idx] = fs.predict_proba(X_te_sel)[:, 1]
 
@@ -902,19 +927,11 @@ def run_shap_analysis(
     X_sel, selected = select_features(X_s, y, task=task)
 
     # Train model on full data for SHAP
-    if _HAS_XGB:
-        if task == "regression":
-            model = XGBRegressor(n_estimators=200, max_depth=6, learning_rate=0.1,
-                                  random_state=cfg.RANDOM_STATE, verbosity=0)
-        else:
-            model = XGBClassifier(n_estimators=200, max_depth=6, learning_rate=0.1,
-                                   random_state=cfg.RANDOM_STATE, verbosity=0,
-                                   use_label_encoder=False, eval_metric="logloss")
+    # Use RandomForest for SHAP to avoid shap/xgboost version incompatibility
+    if task == "regression":
+        model = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=cfg.RANDOM_STATE)
     else:
-        if task == "regression":
-            model = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=cfg.RANDOM_STATE)
-        else:
-            model = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=cfg.RANDOM_STATE)
+        model = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=cfg.RANDOM_STATE)
 
     model.fit(X_sel, y)
 
@@ -943,9 +960,20 @@ def run_shap_analysis(
     plt.close("all")
     logger.info("Saved SHAP beeswarm plot: %s", fig_path)
 
-    # Return feature importances
-    mean_abs_shap = np.abs(shap_values).mean(axis=0)
-    importance = dict(zip(X_sel.columns, mean_abs_shap))
+    # Return feature importances. SHAP may return:
+    #   regression:                  ndarray (n_samples, n_features)
+    #   classifier (old shap):       list of (n_samples, n_features) arrays, one per class
+    #   classifier (shap >= 0.42):   ndarray (n_samples, n_features, n_classes)
+    if isinstance(shap_values, list):
+        mean_abs_shap = np.mean([np.abs(sv).mean(axis=0) for sv in shap_values], axis=0)
+    else:
+        arr = np.abs(np.asarray(shap_values))
+        if arr.ndim == 3:
+            mean_abs_shap = arr.mean(axis=(0, 2))
+        else:
+            mean_abs_shap = arr.mean(axis=0)
+    mean_abs_shap = np.asarray(mean_abs_shap).ravel()
+    importance = dict(zip(X_sel.columns, mean_abs_shap.tolist()))
     importance = dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
 
     logger.info("  Top 10 SHAP features (%s):", task)
@@ -1244,6 +1272,155 @@ def run_severity_classification(
     }
 
 
+# ── Binary severity classification (raw per-item TETRAS) ────────────────
+
+def run_binary_severity_classification(
+    features_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    """Binary severity classification for ET patients via LOSO CV.
+
+    Per advisor feedback: group raw per-item TETRAS cell values into
+    {0, 1} → "Low"  vs  {2, 3, 4} → "High"  (cfg.SEVERITY_BINARY_THRESHOLD).
+
+    The per-cycle target is the hand-matched CRF cell already used in
+    run_bucketed_regression (rt_scoop / lf_scoop / rt_stab / lf_stab).
+    Each cycle is labelled Low or High based on its matched cell value.
+
+    Returns a dict with ``y_true``, ``y_pred``, ``labels``, ``Accuracy``,
+    ``AUC``, ``Sensitivity``, ``Specificity``, and ``class_counts``;
+    or an empty dict if classification is not feasible.
+    """
+    from sklearn.pipeline import Pipeline
+    from sklearn.base import clone
+
+    et_df = features_df[features_df["group"] == "ET"].copy()
+
+    required = {"hand", "movement_type", "rt_scoop", "lf_scoop", "rt_stab", "lf_stab"}
+    missing = required - set(et_df.columns)
+    if missing:
+        logger.warning(
+            "run_binary_severity_classification: missing columns %s — skipping", missing
+        )
+        return {}
+
+    if len(et_df) < 6:
+        logger.warning(
+            "Binary severity classification: only %d ET rows — skipping", len(et_df)
+        )
+        return {}
+
+    # Derive hand-matched raw TETRAS cell value for each cycle
+    def _matched_cell(row: pd.Series) -> float:
+        mt = row.get("movement_type", "")
+        hand = row.get("hand", "Right")
+        if mt == "scoop":
+            return float(row["rt_scoop"] if hand == "Right" else row["lf_scoop"])
+        elif mt == "stab":
+            return float(row["rt_stab"] if hand == "Right" else row["lf_stab"])
+        return float("nan")
+
+    et_df["_raw_tetras_cell"] = et_df.apply(_matched_cell, axis=1)
+
+    # Drop cycles without a valid matched cell
+    valid_mask = et_df["_raw_tetras_cell"].notna()
+    et_df = et_df[valid_mask].reset_index(drop=True)
+
+    if len(et_df) < 6:
+        logger.warning(
+            "Binary severity classification: only %d cycles after cell matching — skipping",
+            len(et_df),
+        )
+        return {}
+
+    # Apply binary threshold: < SEVERITY_BINARY_THRESHOLD → "Low", >= → "High"
+    threshold = cfg.SEVERITY_BINARY_THRESHOLD
+    binary_labels = cfg.SEVERITY_BINARY_LABELS  # ["Low", "High"]
+    severity = np.where(
+        et_df["_raw_tetras_cell"].values < threshold,
+        binary_labels[0],
+        binary_labels[1],
+    )
+
+    class_counts = dict(Counter(severity))
+    present_labels = [l for l in binary_labels if class_counts.get(l, 0) > 0]
+    logger.info(
+        "Binary severity distribution (threshold=%d): %s", threshold, class_counts
+    )
+
+    if len(present_labels) < 2:
+        logger.warning(
+            "Binary severity classification: fewer than 2 classes present — skipping"
+        )
+        return {"class_counts": class_counts}
+
+    X = (
+        et_df[_feature_cols(et_df)]
+        .select_dtypes(include=[np.number])
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+    groups = et_df["patient_id"].values
+
+    # Encode "Low"=0, "High"=1 for binary metrics
+    y_enc = (severity == binary_labels[1]).astype(int)
+
+    cv = _build_cv(pd.Series(groups), task="classification")
+    n_select = min(cfg.TOP_K_FEATURES, max(2, X.shape[1] - 1))
+
+    pipe = Pipeline([
+        ("vt", VarianceThreshold()),
+        ("scaler", StandardScaler()),
+        ("rfe", RFE(
+            estimator=RandomForestClassifier(
+                n_estimators=50, max_depth=5, class_weight="balanced",
+                random_state=cfg.RANDOM_STATE, n_jobs=-1,
+            ),
+            n_features_to_select=n_select,
+            step=0.1,
+        )),
+        ("model", RandomForestClassifier(
+            n_estimators=100, max_depth=8, class_weight="balanced",
+            random_state=cfg.RANDOM_STATE, n_jobs=-1,
+        )),
+    ])
+
+    try:
+        y_pred_enc = cross_val_predict(pipe, X.values, y_enc, cv=cv, groups=groups)
+        y_score = cross_val_predict(
+            pipe, X.values, y_enc, cv=cv, groups=groups, method="predict_proba"
+        )[:, 1]
+    except Exception as exc:
+        logger.warning("Binary severity classification failed: %s", exc, exc_info=True)
+        return {}
+
+    y_pred_labels = np.where(y_pred_enc == 1, binary_labels[1], binary_labels[0])
+    acc = accuracy_score(severity, y_pred_labels)
+
+    clf_metrics = compute_classification_metrics(y_enc, y_pred_enc, y_score)
+
+    logger.info(
+        "Binary severity: Accuracy=%.3f  AUC=%.3f  Sensitivity=%.3f  Specificity=%.3f",
+        acc,
+        clf_metrics.get("AUC", float("nan")),
+        clf_metrics.get("Sensitivity", float("nan")),
+        clf_metrics.get("Specificity", float("nan")),
+    )
+
+    return {
+        "y_true":       severity,
+        "y_pred":       y_pred_labels,
+        "y_true_enc":   y_enc,
+        "y_score":      y_score,
+        "labels":       present_labels,
+        "Accuracy":     acc,
+        "AUC":          clf_metrics.get("AUC", float("nan")),
+        "Sensitivity":  clf_metrics.get("Sensitivity", float("nan")),
+        "Specificity":  clf_metrics.get("Specificity", float("nan")),
+        "class_counts": class_counts,
+        "threshold":    threshold,
+    }
+
+
 # ── Calibrated classifiers ───────────────────────────────────────────────
 
 def run_calibrated_classification(
@@ -1252,7 +1429,8 @@ def run_calibrated_classification(
     """Run classification with CalibratedClassifierCV (Platt scaling).
 
     Scaling and RFE are applied **within** each CV fold to prevent
-    data leakage.  SMOTE is applied after scaling+RFE on training fold.
+    data leakage. Class imbalance is handled via class_weight / bal_weight on the model.
+    SMOTE was removed: segment-level resampling leaks patient identity in LOSO.
     """
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.feature_selection import RFE
@@ -1282,8 +1460,6 @@ def run_calibrated_classification(
     }
 
     results: Dict[str, Dict[str, float]] = {}
-    from imblearn.over_sampling import SMOTE
-    smote = SMOTE(random_state=cfg.RANDOM_STATE)
 
     for name, base in base_models.items():
         y_pred = np.zeros(len(y))
@@ -1316,17 +1492,13 @@ def run_calibrated_classification(
             X_train_sel = rfe.transform(X_train_s)
             X_test_sel = rfe.transform(X_test_s)
 
-            # 3. SMOTE on selected+scaled train data
-            try:
-                X_train_res, y_train_res = smote.fit_resample(X_train_sel, y_train)
-            except ValueError:
-                X_train_res, y_train_res = X_train_sel, y_train
-
-            # 4. Fit calibrated model and predict
+            # 3. Fit calibrated model and predict.
+            # Class imbalance handled by class_weight / bal_weight on the base model.
+            # SMOTE removed: segment-level resampling leaks patient identity in LOSO.
             from sklearn.base import clone
             calibrated = CalibratedClassifierCV(clone(base), cv=3, method="sigmoid")
             try:
-                calibrated.fit(X_train_res, y_train_res)
+                calibrated.fit(X_train_sel, y_train)
                 y_pred[test_idx] = calibrated.predict(X_test_sel)
                 y_score[test_idx] = calibrated.predict_proba(X_test_sel)[:, 1]
             except (ValueError, AttributeError):

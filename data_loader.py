@@ -127,7 +127,9 @@ def load_imu(filepath: str) -> pd.DataFrame:
     Raises:
         ValueError: If the file has fewer than 10 columns.
     """
-    df = pd.read_csv(filepath, header=None)
+    # encoding="utf-8-sig" strips the UTF-8 BOM on the first cell if present,
+    # preventing silent NaN corruption on BOM-marked CSV files.
+    df = pd.read_csv(filepath, header=None, encoding="utf-8-sig")
     if df.shape[1] < 10:
         raise ValueError(
             f"{filepath} has only {df.shape[1]} columns, expected ≥ 10"

@@ -50,6 +50,7 @@ from ml_pipeline import (
     run_calibrated_classification,
     run_bucketed_regression,
     run_severity_classification,
+    run_binary_severity_classification,
     _build_cv,
 )
 import visualization as viz
@@ -429,6 +430,12 @@ def main() -> None:
     except Exception as _exc:
         logger.warning("Severity classification (global_score) crashed: %s", _exc, exc_info=True)
         sev_global = {}
+    # Binary severity: {0,1} vs {2,3,4} on raw per-item TETRAS cells (advisor item 3a)
+    try:
+        sev_binary = run_binary_severity_classification(features_df)
+    except Exception as _exc:
+        logger.warning("Binary severity classification crashed: %s", _exc, exc_info=True)
+        sev_binary = {}
 
     # ── STAGE 8: Visualisations ───────────────────────────────────────────
     logger.info("")
@@ -443,6 +450,9 @@ def main() -> None:
 
     viz.plot_pca(features_df, label_col="is_et", filename="pca_et_vs_control.png")
     viz.plot_boxplot(features_df, group_col="group", filename="boxplot_features.png")
+
+    # UMAP scatter — EDA only (advisor item 1b/1c); no model input
+    viz.plot_umap(features_df, label_col="is_et", filename="umap_et_vs_control.png")
 
     if "movement_type" in features_df.columns:
         viz.plot_cluster_pca(features_df, cluster_col="movement_type",
@@ -493,10 +503,13 @@ def main() -> None:
                     pipe_reg, X, y,
                     cv=KFold(cfg.CV_FOLDS, shuffle=True, random_state=cfg.RANDOM_STATE),
                 )
+            # Pull train_R2 from regression results if available (advisor item 4c)
+            _rf_reg = (reg_local or {}).get("RandomForest", {})
             viz.plot_scatter(
                 y.values, y_pred,
                 title="Local Score - RandomForest (LOSO CV)",
                 filename="scatter_local_score.png",
+                r2_train=_rf_reg.get("train_R2"),
             )
             viz.plot_bland_altman(
                 y.values, y_pred,
@@ -581,6 +594,7 @@ def main() -> None:
         "rfe_stability": rfe_stab,
         "sev_local": sev_local,
         "sev_global": sev_global,
+        "sev_binary": sev_binary,
     }
     report_path = generate_report(
         metrics_dict=report_metrics,

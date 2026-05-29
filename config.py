@@ -11,7 +11,7 @@ import os
 # Paths
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_DATA_BASE = r"E:\Fork\Cup\cupcode\New Data"
+_DATA_BASE = r"C:\Users\maor1\Desktop\fork\New Data"
 DATA_ROOT = os.path.join(_DATA_BASE, "משתתפים")
 CRF_PATH = os.path.join(_DATA_BASE, "HIT Study CRF - No personal Data.xlsx")
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output", "figures")
@@ -152,3 +152,10 @@ SEVERITY_LOCAL_BINS   = [0.0, 1.5, 3.0, 4.5]
 SEVERITY_LOCAL_LABELS = ["Mild", "Moderate", "Severe"]
 SEVERITY_GLOBAL_BINS   = [0.0, 8.0, 20.0, 100.0]
 SEVERITY_GLOBAL_LABELS = ["Mild", "Moderate", "Severe"]
+
+# Binary severity grouping per advisor feedback:
+# Raw per-item TETRAS cell values 0–1 → "Low", 2–4 → "High"
+# Applied to raw per-cycle CRF cells (rt_scoop, lf_scoop, rt_stab, lf_stab),
+# not to the averaged local_score.
+SEVERITY_BINARY_THRESHOLD = 2      # raw TETRAS cell value: < this → "Low", >= this → "High"
+SEVERITY_BINARY_LABELS    = ["Low", "High"]   # Low = {0,1}, High = {2,3,4}

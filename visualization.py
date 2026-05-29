@@ -40,15 +40,31 @@ def plot_scatter(
     y_pred: np.ndarray,
     title: str,
     filename: str,
+    r2_train: Optional[float] = None,
+    r2_cv: Optional[float] = None,
+    r2_target: float = 0.70,
 ) -> None:
-    """Scatter plot of true vs predicted scores.
+    """Scatter plot of true vs predicted scores with R² annotations.
+
+    Annotates CV R² (and train R² when provided) directly on the figure.
+    Draws a dashed horizontal reference at r2_target (default 0.70 per
+    advisor guidance) on a secondary R² axis if train/CV R² are supplied.
 
     Args:
         y_true: Ground-truth values.
         y_pred: Predicted values.
         title: Plot title.
         filename: Output filename (e.g. ``"scatter_local.png"``).
+        r2_train: Optional train-fold R² to annotate (advisor item 4a/4c).
+        r2_cv: Optional CV (test) R² to annotate; computed from y_true/y_pred
+               if not provided.
+        r2_target: Target R² reference line (default 0.70).
     """
+    from sklearn.metrics import r2_score as _r2
+
+    if r2_cv is None:
+        r2_cv = _r2(y_true, y_pred)
+
     fig, ax = plt.subplots(figsize=(6, 5))
     ax.scatter(y_true, y_pred, alpha=0.7, edgecolors="k", linewidths=0.5)
     lims = [
@@ -60,6 +76,20 @@ def plot_scatter(
     ax.set_ylim(lims)
     ax.set_xlabel("True Score")
     ax.set_ylabel("Predicted Score")
+
+    # Annotate R² values on the figure
+    annotation_lines = [f"CV R² = {r2_cv:.3f}"]
+    if r2_train is not None:
+        annotation_lines.insert(0, f"Train R² = {r2_train:.3f}")
+    annotation_lines.append(f"Target R² ≥ {r2_target:.2f}")
+    ax.text(
+        0.05, 0.95, "\n".join(annotation_lines),
+        transform=ax.transAxes,
+        verticalalignment="top",
+        fontsize=9,
+        bbox={"boxstyle": "round,pad=0.3", "facecolor": "wheat", "alpha": 0.7},
+    )
+
     ax.set_title(title)
     _savefig(fig, filename)
 
@@ -148,6 +178,74 @@ def plot_pca(
     _savefig(fig, filename)
 
 
+def plot_umap(
+    features_df: pd.DataFrame,
+    label_col: str,
+    filename: str,
+    n_neighbors: int = 15,
+    min_dist: float = 0.1,
+    random_state: int = 42,
+) -> None:
+    """2-D UMAP projection coloured by label (advisor item 1b/1c — EDA only).
+
+    UMAP is used **purely for visualization** — the reduced components are
+    never passed into estimators.  Named model features are preserved as-is.
+
+    Requires ``umap-learn`` (``pip install umap-learn``).  If the library is
+    not installed, a warning is logged and the function returns without error.
+
+    Args:
+        features_df: DataFrame with features + label column.
+        label_col: Column to colour by (e.g. ``"is_et"`` or ``"severity"``).
+        filename: Output filename.
+        n_neighbors: UMAP neighbourhood size parameter.
+        min_dist: UMAP minimum distance parameter.
+        random_state: Random seed for reproducibility.
+    """
+    try:
+        import umap as umap_lib
+    except ImportError:
+        logger.warning(
+            "umap-learn not installed — UMAP plot skipped. "
+            "Install with: pip install umap-learn"
+        )
+        return
+
+    from sklearn.impute import SimpleImputer
+
+    feat_cols = [c for c in features_df.columns if c not in META_COLS]
+    X_df = features_df[feat_cols].select_dtypes(include=[np.number])
+    if X_df.shape[1] == 0:
+        logger.warning("UMAP plot skipped: no numeric feature columns available.")
+        return
+
+    X = X_df.values
+    imputer = SimpleImputer(strategy="mean")
+    X_imputed = imputer.fit_transform(X)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_imputed)
+
+    reducer = umap_lib.UMAP(
+        n_components=2,
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
+        random_state=random_state,
+    )
+    comp = reducer.fit_transform(X_scaled)
+
+    label_values = features_df[label_col].values
+    fig, ax = plt.subplots(figsize=(7, 5))
+    scatter = ax.scatter(
+        comp[:, 0], comp[:, 1], c=label_values, cmap="coolwarm",
+        alpha=0.8, edgecolors="k", linewidths=0.5,
+    )
+    ax.set_xlabel("UMAP-1")
+    ax.set_ylabel("UMAP-2")
+    ax.set_title(f"UMAP — colored by {label_col}")
+    fig.colorbar(scatter, ax=ax, label=label_col)
+    _savefig(fig, filename)
+
+
 def plot_roc(
     y_true: np.ndarray,
     y_score: np.ndarray,
@@ -206,7 +304,10 @@ def plot_confusion_matrix(
     filename: str,
     labels: Optional[List[str]] = None,
 ) -> None:
-    """Confusion matrix heatmap.
+    """Two-panel confusion matrix heatmap: raw counts + row-normalised recall.
+
+    Normalisation adjusts for class imbalance (advisor requirement) so the
+    right panel shows per-class recall regardless of group size differences.
 
     Args:
         y_true: True labels.
@@ -216,25 +317,40 @@ def plot_confusion_matrix(
     """
     from sklearn.metrics import confusion_matrix as cm_func
 
-    cm = cm_func(y_true, y_pred)
     if labels is None:
         labels = ["Control", "ET"]
 
-    fig, ax = plt.subplots(figsize=(5, 4))
-    im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
-    fig.colorbar(im, ax=ax, label="Count")
-    ax.set_xticks(range(len(labels)))
-    ax.set_yticks(range(len(labels)))
-    ax.set_xticklabels(labels)
-    ax.set_yticklabels(labels)
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("True")
-    ax.set_title("Confusion Matrix")
+    cm = cm_func(y_true, y_pred, labels=list(range(len(labels))))
+    row_sums = cm.sum(axis=1, keepdims=True)
+    # Row-normalised: each row sums to 1 (per-class recall / sensitivity)
+    cm_norm = np.divide(cm.astype(float), row_sums, where=row_sums > 0)
 
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, f"{cm[i, j]}", ha="center", va="center",
-                    color="white" if cm[i, j] > cm.max() / 2 else "black")
+    n = len(labels)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    panels = [
+        (axes[0], cm,      lambda v: f"{int(v)}",  "Counts",             "Count"),
+        (axes[1], cm_norm, lambda v: f"{v:.0%}",   "Row-Normalised (%)", "Recall"),
+    ]
+    for ax, data, fmt_fn, subtitle, cbar_lbl in panels:
+        vmax = None if subtitle == "Counts" else 1.0
+        im   = ax.imshow(data, interpolation="nearest", cmap="Blues", vmin=0, vmax=vmax)
+        fig.colorbar(im, ax=ax, label=cbar_lbl)
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        ax.set_xticklabels(labels)
+        ax.set_yticklabels(labels)
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("True")
+        ax.set_title(f"Confusion Matrix — {subtitle}")
+        threshold = data.max() / 2.0
+        for i in range(n):
+            for j in range(n):
+                ax.text(
+                    j, i, fmt_fn(data[i, j]),
+                    ha="center", va="center",
+                    color="white" if data[i, j] > threshold else "black",
+                )
 
     fig.tight_layout()
     _savefig(fig, filename)

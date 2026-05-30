@@ -372,8 +372,6 @@ def main() -> None:
                 group=group,
                 local_score=scores["local_score"],
                 global_score=scores["global_score"],
-                age=scores.get("age", 65.0),
-                gender=scores.get("gender", 0.0),
             )
 
             if row_df is not None:
@@ -560,7 +558,17 @@ def main() -> None:
     viz.plot_boxplot(features_df, group_col="group", filename="boxplot_features.png")
 
     # UMAP scatter — EDA only (advisor item 1b/1c); no model input
-    viz.plot_umap(features_df, label_col="is_et", filename="umap_et_vs_control.png")
+    umap_df = features_df.copy()
+    umap_df["severity_binary"] = umap_df["local_score"].apply(
+        lambda s: cfg.SEVERITY_BINARY_LABELS[1] if s >= cfg.SEVERITY_BINARY_THRESHOLD
+        else cfg.SEVERITY_BINARY_LABELS[0]
+    )
+    viz.plot_umap(umap_df, label_col="is_et",          filename="umap_et_vs_control.png")
+    viz.plot_umap(umap_df, label_col="group",          filename="umap_group.png")
+    viz.plot_umap(umap_df, label_col="local_score",    filename="umap_local_score.png")
+    viz.plot_umap(umap_df, label_col="severity_binary", filename="umap_severity_binary.png")
+    if "movement_type" in umap_df.columns:
+        viz.plot_umap(umap_df, label_col="movement_type", filename="umap_movement_type.png")
 
     if "movement_type" in features_df.columns:
         viz.plot_cluster_pca(features_df, cluster_col="movement_type",

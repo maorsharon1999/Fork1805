@@ -4,22 +4,30 @@ Shared utilities: logging configuration, directory helpers, label normalisation.
 
 import logging
 import os
+from datetime import datetime
 
 import config as cfg
 
 
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
-    """Configure the root logger with timestamped format.
-
-    Args:
-        level: Logging level (default ``logging.INFO``).
-
-    Returns:
-        The configured root logger.
-    """
+    """Configure root logger: console + timestamped log file (never overwritten)."""
     fmt = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
+
+    log_dir = os.path.join(cfg.SCRIPT_DIR, "output", "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = os.path.join(log_dir, f"run_{timestamp}.log")
+
     logging.basicConfig(format=fmt, level=level, datefmt="%H:%M:%S")
-    return logging.getLogger("fork_pipeline")
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter(fmt=fmt, datefmt="%H:%M:%S"))
+    file_handler.setLevel(level)
+    logging.getLogger().addHandler(file_handler)
+
+    logger = logging.getLogger("fork_pipeline")
+    logger.info("Log file: %s", log_path)
+    return logger
 
 
 def ensure_output_dirs() -> None:

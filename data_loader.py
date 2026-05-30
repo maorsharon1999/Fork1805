@@ -170,7 +170,6 @@ def load_crf_scores(
             ``local_score``  – avg of relevant scoop+stab cells (backward compat)
             ``global_score`` – Subtotal B Extended
             ``rt_scoop``, ``lf_scoop``, ``rt_stab``, ``lf_stab`` – individual cells
-            ``age``, ``gender``
         or *None* if the patient cannot be found or scores are missing.
     """
     _zero_scores = {
@@ -183,8 +182,6 @@ def load_crf_scores(
         record = crf.get(patient_id)
         base = {
             "local_score": 0.0, "global_score": 0.0,
-            "age": record.get("age", 65.0) if record else 65.0,
-            "gender": record.get("gender", 0.0) if record else 0.0,
         }
         base.update(_zero_scores)
         return base
@@ -239,8 +236,6 @@ def load_crf_scores(
         "lf_scoop": float(lf_scoop) if lf_scoop is not None else 0.0,
         "rt_stab": float(rt_stab) if rt_stab is not None else 0.0,
         "lf_stab": float(lf_stab) if lf_stab is not None else 0.0,
-        "age": record.get("age", 65.0),
-        "gender": record.get("gender", 0.0),
     }
 
 

@@ -74,6 +74,8 @@ META_COLS = [
     "global_score", "is_et",
     # bucketed regression extras (not features)
     "movement_type", "rt_scoop", "lf_scoop", "rt_stab", "lf_stab",
+    # demographic columns — not used as model features
+    "age", "gender",
 ]
 
 

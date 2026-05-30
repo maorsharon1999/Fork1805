@@ -737,8 +737,6 @@ def extract_all_features(
     group: str,
     local_score: float,
     global_score: float,
-    age: float = 65.0,
-    gender: float = 0.0,
 ) -> Optional[pd.DataFrame]:
     """Extract features from all segments.
 
@@ -753,8 +751,6 @@ def extract_all_features(
         group: ``"ET"`` or ``"Control"``.
         local_score: Fork feeding score.
         global_score: Subtotal B Extended score.
-        age: Patient age in years.
-        gender: 0 for Female, 1 for Male.
 
     Returns:
         DataFrame with feature rows plus metadata, or *None*.
@@ -776,8 +772,6 @@ def extract_all_features(
         "hand": hand,
         "local_score": local_score,
         "global_score": global_score,
-        "age": age,
-        "gender": gender,
         "is_et": 1 if group == "ET" else 0,
     }
 
